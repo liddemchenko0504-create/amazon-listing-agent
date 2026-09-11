@@ -1,0 +1,17 @@
+{
+  "name": "amazon-listing-agent",
+  "version": "0.1.0",
+  "description": "MVP Amazon listing extractor by ASIN (Stage 1, no AI)",
+  "type": "module",
+  "scripts": {
+    "extract": "tsx extractor/run.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "tsx": "^4.15.0",
+    "@types/node": "^20.14.0"
+  }
+}

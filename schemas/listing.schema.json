@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AmazonListingExtract",
+  "type": "object",
+  "required": ["asin", "marketplace", "title", "bullets", "gallery", "aplus", "scrapedAt"],
+  "properties": {
+    "asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+    "marketplace": { "type": "string", "enum": ["US", "UK", "DE", "CA"] },
+    "brand": { "type": ["string", "null"] },
+    "rating": { "type": ["number", "null"] },
+    "reviewCount": { "type": ["integer", "null"] },
+    "bsrMain": { "type": "object" },
+    "bsrSub": { "type": "object" },
+    "title": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "content": { "type": ["string", "null"] }
+      }
+    },
+    "bullets": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "count": { "type": "integer" },
+        "content": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "description": {
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "content": { "type": ["string", "null"] }
+      }
+    },
+    "productDetails": {
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "ingredients": { "type": ["string", "null"] },
+        "directions": { "type": ["string", "null"] },
+        "warnings": { "type": ["string", "null"] }
+      }
+    },
+    "gallery": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "images": { "type": "array", "items": { "type": "string" } },
+        "hasVideo": { "type": "boolean" },
+        "videoUrls": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "aplus": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "moduleCount": { "type": "integer" },
+        "imageUrls": { "type": "array", "items": { "type": "string" } },
+        "isPremium": { "type": "boolean" }
+      }
+    },
+    "brandStory": {
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "imageUrls": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "comparisonChart": {
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "imageUrl": { "type": ["string", "null"] }
+      }
+    },
+    "variations": {
+      "type": "object",
+      "properties": {
+        "status": { "$ref": "#/definitions/blockStatus" },
+        "asins": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "backendKeywords": {
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "enum": ["NOT_ACCESSIBLE"] }
+      }
+    },
+    "parentAsin": { "type": ["string", "null"] },
+    "scrapedAt": { "type": "string", "format": "date-time" }
+  },
+  "definitions": {
+    "blockStatus": {
+      "type": "string",
+      "enum": ["PRESENT", "WEAK", "MISSING", "NOT_ACCESSIBLE"]
+    }
+  }
+}
