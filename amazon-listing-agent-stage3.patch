@@ -1,0 +1,436 @@
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/README.md b/README.md
+--- a/README.md	2026-09-11 08:51:22.116302183 +0000
++++ b/README.md	2026-09-11 08:51:09.927713421 +0000
+@@ -85,11 +85,60 @@
+ Картинки в git не коммитятся (см. `.gitignore`) — храните их локально
+ или переносите в отдельное объектное хранилище при необходимости.
+ 
++## Stage 3 — OCR
++
++Читает `manifest.json` от Image Downloader и прогоняет OCR по каждой
++реально скачанной картинке (gallery + A+ + Brand Story + Comparison
++Chart). Результат — `fixtures/<ASIN>/images/ocr-results.json`.
++
++**Использует системный `tesseract` CLI, а не npm-пакет `tesseract.js`.**
++Причина: `tesseract.js` при первом запуске тянет языковые данные с CDN,
++что не всегда доступно в закрытых/CI-окружениях. Системный бинарник —
++разовая установка, которую использует большинство продакшен-пайплайнов
++под капотом.
++
++Установка:
++
++```bash
++# Ubuntu/Debian
++apt install tesseract-ocr
++
++# macOS
++brew install tesseract
++
++# Windows
++# https://github.com/UB-Mannheim/tesseract/wiki
++```
++
++Запуск:
++
++```bash
++npm run ocr -- fixtures/B0B2RM68G2/images/manifest.json
++# с настройками:
++npm run ocr -- fixtures/B0B2RM68G2/images/manifest.json --psm 3 --concurrency 4
++```
++
++Каждая запись в `ocr-results.json` содержит:
++- `text` — распознанный текст;
++- `meanConfidence` — средняя уверенность tesseract по словам (0–100);
++- `needsReview: true`, если `meanConfidence < 60` — распознанный текст
++  на зашумлённых/стилизованных картинках (фото с текстом поверх)
++  может быть мусором, флаг говорит "проверь глазами, не доверяй
++  вслепую";
++- `status: "no_text_found"` для картинок без текста (например, чисто
++  фото продукта без наложенного текста) — это ожидаемо, не ошибка.
++
++`--psm` (page segmentation mode) стоит попробовать поменять, если
++результат пустой или мусорный: `6` (по умолчанию здесь) — для одного
++блока текста поверх картинки (типичный A+ callout), `3` — для картинок
++с несколькими независимыми текстовыми зонами (например, comparison
++chart с таблицей).
++
+ ## Roadmap
+ 
+ 1. ✅ Extractor — базовые публичные поля
+ 2. ✅ Image Downloader — сохранить gallery + A+ картинки локально
+-3. OCR — вытащить текст с A+ картинок (например Tesseract или Claude vision)
++3. ✅ OCR — вытащить текст с A+ картинок (tesseract CLI)
+ 4. Content Inventory — свести всё в единый статус-отчёт
+ 5. Beauty Audit — completeness score, claims-проверка, gap detection
+ 6. AI Optimization — сгенерировать улучшенные title/bullets/недостающие блоки
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/ocr/batch.ts b/ocr/batch.ts
+--- a/ocr/batch.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/ocr/batch.ts	2026-09-11 08:51:10.894469982 +0000
+@@ -0,0 +1,134 @@
++/**
++ * batch.ts
++ *
++ * Takes the manifest.json produced by downloader/run.ts (one entry per
++ * image: category, sourceUrl, localPath, status) and runs OCR on every
++ * image that actually downloaded (`status: "ok"`). Failed/duplicate
++ * entries are skipped since there's no local file to read.
++ */
++
++import { readFileSync, writeFileSync } from "fs";
++import path from "path";
++import { runOcr, type OcrResult, type OcrOptions } from "./tesseract";
++import type { DownloadManifest, DownloadResult } from "../downloader/images";
++
++/** Below this mean word confidence, flag the result for human review
++ * instead of trusting it silently — busy product-photo backgrounds
++ * and stylized fonts commonly produce garbled low-confidence reads. */
++export const LOW_CONFIDENCE_THRESHOLD = 60;
++
++export interface OcrManifestEntry {
++  category: DownloadResult["category"];
++  sourceUrl: string;
++  localPath: string;
++  status: "ok" | "failed" | "no_text_found";
++  text: string;
++  meanConfidence: number | null;
++  wordCount: number;
++  needsReview: boolean;
++  error?: string;
++}
++
++export interface OcrManifest {
++  asin: string;
++  generatedAt: string;
++  entries: OcrManifestEntry[];
++  summary: {
++    total: number;
++    withText: number;
++    noTextFound: number;
++    failed: number;
++    needsReview: number;
++  };
++}
++
++async function runInBatches<T, R>(
++  items: T[],
++  concurrency: number,
++  worker: (item: T) => Promise<R>
++): Promise<R[]> {
++  const results: R[] = [];
++  for (let i = 0; i < items.length; i += concurrency) {
++    const batch = items.slice(i, i + concurrency);
++    results.push(...(await Promise.all(batch.map(worker))));
++  }
++  return results;
++}
++
++export interface BatchOcrOptions extends OcrOptions {
++  /** OCR is CPU-bound (unlike the network-bound image downloader), so
++   * default concurrency is lower to avoid saturating the machine. */
++  concurrency?: number;
++}
++
++export async function runOcrOnManifest(
++  manifest: DownloadManifest,
++  opts: BatchOcrOptions = {}
++): Promise<OcrManifest> {
++  const concurrency = opts.concurrency ?? 3;
++  const downloaded = manifest.results.filter(
++    (r): r is DownloadResult & { localPath: string } =>
++      r.status === "ok" && Boolean(r.localPath)
++  );
++
++  const entries = await runInBatches(downloaded, concurrency, async (r) => {
++    try {
++      const result: OcrResult = await runOcr(r.localPath, opts);
++      const hasText = result.wordCount > 0;
++      const entry: OcrManifestEntry = {
++        category: r.category,
++        sourceUrl: r.sourceUrl,
++        localPath: r.localPath,
++        status: hasText ? "ok" : "no_text_found",
++        text: result.text,
++        meanConfidence: result.meanConfidence,
++        wordCount: result.wordCount,
++        needsReview:
++          hasText &&
++          result.meanConfidence !== null &&
++          result.meanConfidence < LOW_CONFIDENCE_THRESHOLD,
++      };
++      return entry;
++    } catch (err) {
++      const entry: OcrManifestEntry = {
++        category: r.category,
++        sourceUrl: r.sourceUrl,
++        localPath: r.localPath,
++        status: "failed",
++        text: "",
++        meanConfidence: null,
++        wordCount: 0,
++        needsReview: false,
++        error: err instanceof Error ? err.message : String(err),
++      };
++      return entry;
++    }
++  });
++
++  const ocrManifest: OcrManifest = {
++    asin: manifest.asin,
++    generatedAt: new Date().toISOString(),
++    entries,
++    summary: {
++      total: entries.length,
++      withText: entries.filter((e) => e.status === "ok").length,
++      noTextFound: entries.filter((e) => e.status === "no_text_found").length,
++      failed: entries.filter((e) => e.status === "failed").length,
++      needsReview: entries.filter((e) => e.needsReview).length,
++    },
++  };
++
++  const manifestDir = downloaded.length
++    ? path.dirname(path.dirname(downloaded[0].localPath)) // .../images/
++    : "fixtures";
++  writeFileSync(
++    path.join(manifestDir, "ocr-results.json"),
++    JSON.stringify(ocrManifest, null, 2)
++  );
++
++  return ocrManifest;
++}
++
++export function loadDownloadManifest(manifestPath: string): DownloadManifest {
++  return JSON.parse(readFileSync(manifestPath, "utf-8"));
++}
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/ocr/run.ts b/ocr/run.ts
+--- a/ocr/run.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/ocr/run.ts	2026-09-11 08:51:10.894583327 +0000
+@@ -0,0 +1,67 @@
++/**
++ * Usage:
++ *   npx tsx ocr/run.ts fixtures/B0B2RM68G2/images/manifest.json
++ *   npx tsx ocr/run.ts fixtures/B0B2RM68G2/images/manifest.json --psm 3 --concurrency 4
++ *
++ * Requires the `tesseract` CLI to be installed:
++ *   Ubuntu/Debian: apt install tesseract-ocr
++ *   macOS:         brew install tesseract
++ *   Windows:       https://github.com/UB-Mannheim/tesseract/wiki
++ */
++import { loadDownloadManifest, runOcrOnManifest } from "./batch";
++
++function parseFlag(args: string[], name: string): string | undefined {
++  const i = args.indexOf(`--${name}`);
++  return i !== -1 ? args[i + 1] : undefined;
++}
++
++async function main() {
++  const args = process.argv.slice(2);
++  const manifestPath = args[0];
++
++  if (!manifestPath) {
++    console.error(
++      "Usage: run.ts <path-to-download-manifest.json> [--psm N] [--concurrency N] [--lang eng]"
++    );
++    process.exit(1);
++  }
++
++  const manifest = loadDownloadManifest(manifestPath);
++
++  const psm = Number(parseFlag(args, "psm")) || undefined;
++  const concurrency = Number(parseFlag(args, "concurrency")) || undefined;
++  const lang = parseFlag(args, "lang");
++
++  const result = await runOcrOnManifest(manifest, { psm, concurrency, lang });
++
++  console.log(
++    `ASIN ${result.asin}: ${result.summary.withText} with text, ` +
++      `${result.summary.noTextFound} no text, ` +
++      `${result.summary.failed} failed, ` +
++      `${result.summary.needsReview} flagged for review ` +
++      `(of ${result.summary.total} images OCR'd).`
++  );
++
++  const review = result.entries.filter((e) => e.needsReview);
++  if (review.length) {
++    console.log("\nLow-confidence — verify manually:");
++    for (const r of review) {
++      console.log(
++        `  [${r.category}] ${r.localPath} (conf ${r.meanConfidence}): "${r.text.slice(0, 80)}"`
++      );
++    }
++  }
++
++  const failed = result.entries.filter((e) => e.status === "failed");
++  if (failed.length) {
++    console.log("\nOCR failures:");
++    for (const f of failed) {
++      console.log(`  [${f.category}] ${f.localPath} — ${f.error}`);
++    }
++  }
++}
++
++main().catch((err) => {
++  console.error(err);
++  process.exit(1);
++});
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/ocr/tesseract.ts b/ocr/tesseract.ts
+--- a/ocr/tesseract.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/ocr/tesseract.ts	2026-09-11 08:51:10.894319906 +0000
+@@ -0,0 +1,124 @@
++/**
++ * tesseract.ts
++ *
++ * Thin wrapper around the system `tesseract` CLI (not the tesseract.js
++ * npm package). Reasons for using the CLI binary instead of the WASM
++ * port:
++ *   - tesseract.js needs to download language trained-data from a CDN
++ *     on first run; in locked-down/offline environments that fetch
++ *     silently fails or hangs.
++ *   - the system binary (via `apt install tesseract-ocr` / `brew
++ *     install tesseract`) is a one-time, well-cached install and is
++ *     what most production pipelines actually use under the hood.
++ *
++ * We ask tesseract for TSV output instead of plain text so we get a
++ * per-word confidence score — that lets the Beauty-audit layer later
++ * flag "OCR text found but low confidence, verify manually" instead
++ * of silently trusting garbled reads on busy background images.
++ */
++
++import { execFile } from "child_process";
++import { promisify } from "util";
++
++const execFileAsync = promisify(execFile);
++
++export interface OcrWord {
++  text: string;
++  confidence: number; // 0-100, tesseract's own estimate
++}
++
++export interface OcrResult {
++  text: string; // words joined with spaces, line breaks preserved
++  words: OcrWord[];
++  meanConfidence: number | null; // null when no text detected at all
++  wordCount: number;
++}
++
++export interface OcrOptions {
++  /** Page segmentation mode. 6 = "assume a single uniform block of
++   * text", a good default for marketing-image callouts. 3 (tesseract's
++   * default) = "fully automatic page segmentation", better for images
++   * with multiple unrelated text blocks (e.g. a full A+ comparison
++   * chart). Try 3 if 6 returns nothing useful. */
++  psm?: number;
++  lang?: string; // default "eng"
++  timeoutMs?: number; // default 30000
++}
++
++interface TsvRow {
++  level: string;
++  conf: string;
++  text: string;
++}
++
++function parseTsv(tsv: string): TsvRow[] {
++  const lines = tsv.trim().split("\n");
++  const [header, ...rows] = lines;
++  const cols = header.split("\t");
++  const confIdx = cols.indexOf("conf");
++  const textIdx = cols.indexOf("text");
++  const levelIdx = cols.indexOf("level");
++
++  return rows.map((row) => {
++    const fields = row.split("\t");
++    return {
++      level: fields[levelIdx],
++      conf: fields[confIdx],
++      text: fields[textIdx] ?? "",
++    };
++  });
++}
++
++/** Run OCR on a single local image file. Throws if the file doesn't
++ * exist or tesseract isn't installed — callers should catch per-image
++ * so one bad file doesn't abort a whole batch (see ocr/run.ts). */
++export async function runOcr(
++  imagePath: string,
++  opts: OcrOptions = {}
++): Promise<OcrResult> {
++  const psm = String(opts.psm ?? 6);
++  const lang = opts.lang ?? "eng";
++  const timeout = opts.timeoutMs ?? 30_000;
++
++  let stdout: string;
++  try {
++    const res = await execFileAsync(
++      "tesseract",
++      [imagePath, "stdout", "-l", lang, "--psm", psm, "tsv"],
++      { timeout, maxBuffer: 10 * 1024 * 1024 }
++    );
++    stdout = res.stdout;
++  } catch (err: any) {
++    if (err?.code === "ENOENT") {
++      throw new Error(
++        "tesseract binary not found. Install it: `apt install tesseract-ocr` " +
++          "(Ubuntu/Debian) or `brew install tesseract` (macOS)."
++      );
++    }
++    throw err;
++  }
++
++  const rows = parseTsv(stdout);
++  // level 5 = word-level rows in tesseract's TSV hierarchy (1=page,
++  // 2=block, 3=paragraph, 4=line, 5=word).
++  const wordRows = rows.filter((r) => r.level === "5" && r.text.trim());
++
++  const words: OcrWord[] = wordRows.map((r) => ({
++    text: r.text,
++    confidence: parseFloat(r.conf),
++  }));
++
++  const meanConfidence =
++    words.length > 0
++      ? Math.round(
++          (words.reduce((sum, w) => sum + w.confidence, 0) / words.length) * 10
++        ) / 10
++      : null;
++
++  return {
++    text: words.map((w) => w.text).join(" "),
++    words,
++    meanConfidence,
++    wordCount: words.length,
++  };
++}
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/package.json b/package.json
+--- a/package.json	2026-09-11 08:51:11.190028528 +0000
++++ b/package.json	2026-09-11 08:51:09.925472351 +0000
+@@ -5,14 +5,15 @@
+   "type": "module",
+   "scripts": {
+     "extract": "tsx extractor/run.ts",
+-    "download-images": "tsx downloader/run.ts"
++    "download-images": "tsx downloader/run.ts",
++    "ocr": "tsx ocr/run.ts"
+   },
+   "dependencies": {
+-    "cheerio": "^1.0.0"
++    "cheerio": "^1.2.0"
+   },
+   "devDependencies": {
+-    "typescript": "^5.5.0",
+-    "tsx": "^4.15.0",
+-    "@types/node": "^20.14.0"
++    "@types/node": "^20.19.43",
++    "tsx": "^4.23.13",
++    "typescript": "^5.9.3"
+   }
+ }
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' a/tsconfig.json b/tsconfig.json
+--- a/tsconfig.json	2026-09-11 08:51:11.188875234 +0000
++++ b/tsconfig.json	2026-09-11 08:51:09.929735695 +0000
+@@ -8,5 +8,5 @@
+     "skipLibCheck": true,
+     "outDir": "dist"
+   },
+-  "include": ["extractor/**/*.ts", "downloader/**/*.ts"]
++  "include": ["extractor/**/*.ts", "downloader/**/*.ts", "ocr/**/*.ts"]
+ }
